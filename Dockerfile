@@ -15,13 +15,11 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /out/loki-gateway /app/loki-gateway
-COPY config/service.yaml /app/config/service.yaml
 
 ENV BUTTERFLY_CONFIG_TYPE=file \
-    BUTTERFLY_CONFIG_FILE_PATH=./config/service.yaml \
+    BUTTERFLY_CONFIG_FILE_PATH=/app/config/service.yaml \
     BUTTERFLY_TRACING_PROVIDER=http \
     BUTTERFLY_TRACING_ENDPOINT=127.0.0.1:4318
 
-EXPOSE 8080 9090 2223
 
 ENTRYPOINT ["/app/loki-gateway"]
