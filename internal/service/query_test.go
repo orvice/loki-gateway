@@ -64,4 +64,24 @@ func TestQueryProxyUnavailable(t *testing.T) {
 	if !errors.Is(err, ErrQueryUnavailable) {
 		t.Fatalf("expected ErrQueryUnavailable, got %v", err)
 	}
+	if !strings.Contains(err.Error(), "dial failed") {
+		t.Fatalf("expected wrapped root cause in error, got %v", err)
+	}
+}
+
+func TestQueryProxyUnavailableWhenDefaultTargetMissing(t *testing.T) {
+	cfg := config.LokiConfig{
+		DefaultTarget: "missing",
+		Targets:       []config.LokiTarget{{Name: "loki-a", URL: "http://a", TimeoutMS: 1000}},
+	}
+	svc := NewQueryService(cfg, &queryForwarderMock{})
+	req, _ := http.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
+
+	_, _, err := svc.Proxy(context.Background(), req)
+	if !errors.Is(err, ErrQueryUnavailable) {
+		t.Fatalf("expected ErrQueryUnavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "default_target") {
+		t.Fatalf("expected missing default target details in error, got %v", err)
+	}
 }

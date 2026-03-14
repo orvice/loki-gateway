@@ -53,7 +53,7 @@ func main() {
 }
 
 func registerRoutes(r *gin.Engine, cfg *AppConfig) {
-	logger := bflog.FromContext(nil).With("service", serviceName, "component", "loki-gateway")
+	logger := bflog.FromContext(context.Background()).With("service", serviceName, "component", "loki-gateway")
 	fwd := forwarder.NewHTTPClient()
 	pushSvc := service.NewPushService(cfg.Loki, fwd, logger)
 	querySvc := service.NewQueryService(cfg.Loki, fwd)
