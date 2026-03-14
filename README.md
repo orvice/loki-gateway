@@ -27,3 +27,11 @@ make run    # run service
 make test   # run unit tests
 make build  # build binary to ./bin/loki-gateway
 ```
+
+## Loki Endpoints
+
+- `POST /loki/api/v1/push`
+- `GET /loki/api/v1/query`
+- `GET /loki/api/v1/query_range`
+- `GET /loki/api/v1/labels`
+- `GET /loki/api/v1/label/{name}/values`
