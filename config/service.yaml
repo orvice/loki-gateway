@@ -1,6 +1,31 @@
 http:
   greeting: "pong from loki-gateway"
 
+loki:
+  default_target: "loki-a"
+  targets:
+    - name: "loki-a"
+      url: "http://127.0.0.1:3100"
+      tenant_id: ""
+      basic_auth:
+        username: ""
+        password: ""
+      extra_headers: {}
+      timeout_ms: 3000
+    - name: "loki-b"
+      url: "http://127.0.0.1:3101"
+      tenant_id: ""
+      basic_auth:
+        username: ""
+        password: ""
+      extra_headers: {}
+      timeout_ms: 3000
+  rules:
+    - name: "staging"
+      match:
+        env: "staging"
+      target: "loki-b"
+
 store:
   redis:
     default:

@@ -1,0 +1,147 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/orvice/loki-gateway/internal/config"
+)
+
+type pushCall struct {
+	target string
+	body   []byte
+}
+
+type pushForwarderMock struct {
+	mu    sync.Mutex
+	calls []pushCall
+	err   error
+	ch    chan struct{}
+}
+
+func (m *pushForwarderMock) PostPush(_ context.Context, target config.LokiTarget, body []byte, _ http.Header) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, pushCall{target: target.Name, body: body})
+	m.mu.Unlock()
+	if m.ch != nil {
+		m.ch <- struct{}{}
+	}
+	return m.err
+}
+
+func (m *pushForwarderMock) ProxyQuery(context.Context, config.LokiTarget, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
+
+func (m *pushForwarderMock) snapshot() []pushCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]pushCall, len(m.calls))
+	copy(out, m.calls)
+	return out
+}
+
+func TestPushRoutesToMatchedAndDefaultTargets(t *testing.T) {
+	cfg := config.LokiConfig{
+		DefaultTarget: "loki-a",
+		Targets: []config.LokiTarget{
+			{Name: "loki-a", URL: "http://a", TimeoutMS: 1000},
+			{Name: "loki-b", URL: "http://b", TimeoutMS: 1000},
+		},
+		Rules: []config.RouteRule{{Name: "staging", Match: map[string]string{"env": "staging"}, Target: "loki-b"}},
+	}
+	mock := &pushForwarderMock{ch: make(chan struct{}, 2)}
+	svc := NewPushService(cfg, mock, nil)
+
+	body := []byte(`{"streams":[{"stream":{"env":"staging"},"values":[["1","line1"]]},{"stream":{"env":"prod"},"values":[["2","line2"]]}]}`)
+	if err := svc.HandlePush(context.Background(), body, http.Header{}); err != nil {
+		t.Fatalf("HandlePush returned error: %v", err)
+	}
+
+	waitCalls(t, mock.ch, 2)
+	calls := mock.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 forwards, got %d", len(calls))
+	}
+}
+
+func TestPushMulticastDedup(t *testing.T) {
+	cfg := config.LokiConfig{
+		DefaultTarget: "loki-a",
+		Targets: []config.LokiTarget{
+			{Name: "loki-a", URL: "http://a", TimeoutMS: 1000},
+			{Name: "loki-b", URL: "http://b", TimeoutMS: 1000},
+			{Name: "loki-c", URL: "http://c", TimeoutMS: 1000},
+		},
+		Rules: []config.RouteRule{
+			{Name: "r1", Match: map[string]string{"env": "prod"}, Target: "loki-b"},
+			{Name: "r2", Match: map[string]string{"team": "core"}, Target: "loki-c"},
+			{Name: "r3", Match: map[string]string{"env": "prod"}, Target: "loki-b"},
+		},
+	}
+	mock := &pushForwarderMock{ch: make(chan struct{}, 2)}
+	svc := NewPushService(cfg, mock, nil)
+
+	body := []byte(`{"streams":[{"stream":{"env":"prod","team":"core"},"values":[["1","line1"]]}]}`)
+	if err := svc.HandlePush(context.Background(), body, http.Header{}); err != nil {
+		t.Fatalf("HandlePush returned error: %v", err)
+	}
+
+	waitCalls(t, mock.ch, 2)
+	calls := mock.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 unique target forwards, got %d", len(calls))
+	}
+
+	for _, c := range calls {
+		var req pushRequest
+		if err := json.Unmarshal(c.body, &req); err != nil {
+			t.Fatalf("invalid marshaled payload: %v", err)
+		}
+		if len(req.Streams) != 1 {
+			t.Fatalf("expected one stream in payload")
+		}
+	}
+}
+
+func TestPushInvalidPayload(t *testing.T) {
+	svc := NewPushService(config.LokiConfig{}, &pushForwarderMock{}, nil)
+	err := svc.HandlePush(context.Background(), []byte("not-json"), http.Header{})
+	if !errors.Is(err, ErrInvalidPushPayload) {
+		t.Fatalf("expected ErrInvalidPushPayload, got %v", err)
+	}
+}
+
+func TestPushDownstreamFailureDoesNotFailClient(t *testing.T) {
+	cfg := config.LokiConfig{
+		DefaultTarget: "loki-a",
+		Targets:       []config.LokiTarget{{Name: "loki-a", URL: "http://a", TimeoutMS: 1000}},
+	}
+	mock := &pushForwarderMock{err: errors.New("downstream failed"), ch: make(chan struct{}, 1)}
+	svc := NewPushService(cfg, mock, nil)
+	body := []byte(`{"streams":[{"stream":{"env":"dev"},"values":[["1","line"]]}]}`)
+
+	if err := svc.HandlePush(context.Background(), body, http.Header{}); err != nil {
+		t.Fatalf("expected nil error for accepted push, got %v", err)
+	}
+	waitCalls(t, mock.ch, 1)
+}
+
+func waitCalls(t *testing.T, ch <-chan struct{}, n int) {
+	t.Helper()
+	deadline := time.After(500 * time.Millisecond)
+	count := 0
+	for count < n {
+		select {
+		case <-ch:
+			count++
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d calls; got %d", n, count)
+		}
+	}
+}
