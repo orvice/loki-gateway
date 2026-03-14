@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 
 	"butterfly.orx.me/core"
@@ -37,7 +38,7 @@ func main() {
 		},
 		InitFunc: []func() error{
 			func() error {
-				logger := bflog.FromContext(nil).With("service", serviceName)
+				logger := bflog.FromContext(context.Background()).With("service", serviceName)
 				logger.Info("service init hook running")
 				if err := cfg.Loki.Validate(); err != nil {
 					return err
