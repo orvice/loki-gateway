@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	bflog "butterfly.orx.me/core/log"
 	"github.com/orvice/loki-gateway/internal/config"
 )
 
@@ -21,6 +22,17 @@ type HTTPClient struct {
 	client *http.Client
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
 func NewHTTPClient() *HTTPClient {
 	return &HTTPClient{client: &http.Client{}}
 }
@@ -28,12 +40,22 @@ func NewHTTPClient() *HTTPClient {
 func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, body []byte, headers http.Header) error {
 	path := strings.TrimRight(target.URL, "/") + "/loki/api/v1/push"
 	timeout := time.Duration(target.TimeoutMS) * time.Millisecond
+	logger := bflog.FromContext(ctx).With(
+		"component", "forwarder.push",
+		"target", target.Name,
+		"target_url", target.URL,
+		"path", path,
+		"timeout_ms", target.TimeoutMS,
+		"request_id", headers.Get("X-Request-ID"),
+		"tenant", headers.Get("X-Scope-OrgID"),
+	)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
 	if err != nil {
+		logger.Error("create downstream push request failed", "error", err)
 		return err
 	}
 	copyHeaders(headers, req.Header)
@@ -46,14 +68,19 @@ func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, bod
 		req.Header.Set("X-Scope-OrgID", target.TenantID)
 	}
 
+	logger.Info("forward push request", "body_bytes", len(body))
+	start := time.Now()
 	resp, err := c.client.Do(req)
 	if err != nil {
+		logger.Error("forward push request failed", "error", err)
 		return err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
+	logger.Info("forward push response", "status", resp.StatusCode, "latency_ms", time.Since(start).Milliseconds())
 
 	if resp.StatusCode >= http.StatusMultipleChoices {
+		logger.Warn("forward push downstream error status", "status", resp.StatusCode)
 		return fmt.Errorf("downstream push status: %d", resp.StatusCode)
 	}
 
@@ -66,12 +93,23 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, i
 		path += "?" + in.URL.RawQuery
 	}
 	timeout := time.Duration(target.TimeoutMS) * time.Millisecond
+	logger := bflog.FromContext(ctx).With(
+		"component", "forwarder.query",
+		"target", target.Name,
+		"target_url", target.URL,
+		"path", in.URL.Path,
+		"raw_query", in.URL.RawQuery,
+		"timeout_ms", target.TimeoutMS,
+		"request_id", in.Header.Get("X-Request-ID"),
+		"tenant", in.Header.Get("X-Scope-OrgID"),
+	)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, in.Method, path, nil)
 	if err != nil {
+		cancel()
+		logger.Error("create downstream query request failed", "error", err)
 		return nil, err
 	}
 	copyHeaders(in.Header, req.Header)
@@ -81,7 +119,23 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, i
 		req.Header.Set("X-Scope-OrgID", target.TenantID)
 	}
 
-	return c.client.Do(req)
+	logger.Info("forward query request")
+	start := time.Now()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		cancel()
+		logger.Error("forward query request failed", "error", err)
+		return nil, err
+	}
+	resp.Body = &cancelOnCloseReadCloser{
+		ReadCloser: resp.Body,
+		cancel:     cancel,
+	}
+	logger.Info("forward query response", "status", resp.StatusCode, "latency_ms", time.Since(start).Milliseconds())
+	if resp.StatusCode >= http.StatusBadRequest {
+		logger.Warn("forward query downstream error status", "status", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func copyHeaders(src, dst http.Header) {

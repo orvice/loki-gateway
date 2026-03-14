@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,29 @@ import (
 
 	"github.com/orvice/loki-gateway/internal/config"
 )
+
+type contextBoundBody struct {
+	ctx context.Context
+}
+
+func (b *contextBoundBody) Read(_ []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (b *contextBoundBody) Close() error { return nil }
+
+type contextAwareRoundTripper struct{}
+
+func (contextAwareRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &contextBoundBody{ctx: req.Context()},
+		Header:     make(http.Header),
+	}, nil
+}
 
 func TestPostPushForwardsBodyAndHeader(t *testing.T) {
 	var gotBody []byte
@@ -222,5 +246,27 @@ func TestProxyQueryUsesTargetExtraHeadersWithOverride(t *testing.T) {
 	}
 	if gotTrace != "t-1" {
 		t.Fatalf("expected X-Trace-ID from target header, got %s", gotTrace)
+	}
+}
+
+func TestProxyQueryDoesNotCancelBeforeCallerReadsBody(t *testing.T) {
+	client := &HTTPClient{
+		client: &http.Client{Transport: contextAwareRoundTripper{}},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
+	resp, err := client.ProxyQuery(
+		context.Background(),
+		config.LokiTarget{Name: "a", URL: "http://example.com", TimeoutMS: 2000},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("ProxyQuery failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	_, readErr := io.ReadAll(resp.Body)
+	if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+		t.Fatalf("expected response body to remain readable before caller closes it, got %v", readErr)
 	}
 }
