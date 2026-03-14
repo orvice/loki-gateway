@@ -1,0 +1,7 @@
+.git
+.codex
+openspec
+bin
+*.log
+*.tmp
+*.swp
