@@ -40,6 +40,8 @@ func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, bod
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	applyTargetBasicAuth(req, target)
+	applyTargetExtraHeaders(req, target)
 	if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
 		req.Header.Set("X-Scope-OrgID", target.TenantID)
 	}
@@ -73,6 +75,8 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, i
 		return nil, err
 	}
 	copyHeaders(in.Header, req.Header)
+	applyTargetBasicAuth(req, target)
+	applyTargetExtraHeaders(req, target)
 	if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
 		req.Header.Set("X-Scope-OrgID", target.TenantID)
 	}
@@ -85,5 +89,18 @@ func copyHeaders(src, dst http.Header) {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
+	}
+}
+
+func applyTargetBasicAuth(req *http.Request, target config.LokiTarget) {
+	if target.BasicAuth.Username == "" || target.BasicAuth.Password == "" {
+		return
+	}
+	req.SetBasicAuth(target.BasicAuth.Username, target.BasicAuth.Password)
+}
+
+func applyTargetExtraHeaders(req *http.Request, target config.LokiTarget) {
+	for k, v := range target.ExtraHeaders {
+		req.Header.Set(k, v)
 	}
 }

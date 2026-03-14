@@ -86,3 +86,141 @@ func TestProxyQueryForwardsQueryAndHeader(t *testing.T) {
 		t.Fatalf("unexpected scope: %s", gotScope)
 	}
 }
+
+func TestPostPushUsesTargetBasicAuth(t *testing.T) {
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient()
+	err := client.PostPush(
+		context.Background(),
+		config.LokiTarget{
+			Name:      "a",
+			URL:       ts.URL,
+			TimeoutMS: 2000,
+			BasicAuth: config.BasicAuth{Username: "alice", Password: "secret"},
+		},
+		[]byte(`{"streams":[]}`),
+		http.Header{"Authorization": {"Bearer token"}},
+	)
+	if err != nil {
+		t.Fatalf("PostPush failed: %v", err)
+	}
+
+	if gotAuth == "" {
+		t.Fatalf("expected authorization header to be set")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("alice", "secret")
+	if gotAuth != req.Header.Get("Authorization") {
+		t.Fatalf("unexpected authorization header: %s", gotAuth)
+	}
+}
+
+func TestProxyQueryUsesTargetBasicAuth(t *testing.T) {
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient()
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
+	req.Header.Set("Authorization", "Bearer token")
+
+	resp, err := client.ProxyQuery(
+		context.Background(),
+		config.LokiTarget{
+			Name:      "a",
+			URL:       ts.URL,
+			TimeoutMS: 2000,
+			BasicAuth: config.BasicAuth{Username: "bob", Password: "pwd"},
+		},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("ProxyQuery failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	reqExpected := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqExpected.SetBasicAuth("bob", "pwd")
+	if gotAuth != reqExpected.Header.Get("Authorization") {
+		t.Fatalf("unexpected authorization header: %s", gotAuth)
+	}
+}
+
+func TestPostPushUsesTargetExtraHeadersWithOverride(t *testing.T) {
+	var gotRegion, gotTenant string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRegion = r.Header.Get("X-Region")
+		gotTenant = r.Header.Get("X-Tenant")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient()
+	err := client.PostPush(
+		context.Background(),
+		config.LokiTarget{
+			Name:         "a",
+			URL:          ts.URL,
+			TimeoutMS:    2000,
+			ExtraHeaders: map[string]string{"X-Region": "cn", "X-Tenant": "team-a"},
+		},
+		[]byte(`{"streams":[]}`),
+		http.Header{"X-Region": {"us"}},
+	)
+	if err != nil {
+		t.Fatalf("PostPush failed: %v", err)
+	}
+
+	if gotRegion != "cn" {
+		t.Fatalf("expected X-Region to be overridden by target header, got %s", gotRegion)
+	}
+	if gotTenant != "team-a" {
+		t.Fatalf("expected X-Tenant from target header, got %s", gotTenant)
+	}
+}
+
+func TestProxyQueryUsesTargetExtraHeadersWithOverride(t *testing.T) {
+	var gotRegion, gotTrace string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRegion = r.Header.Get("X-Region")
+		gotTrace = r.Header.Get("X-Trace-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewHTTPClient()
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
+	req.Header.Set("X-Region", "us")
+
+	resp, err := client.ProxyQuery(
+		context.Background(),
+		config.LokiTarget{
+			Name:         "a",
+			URL:          ts.URL,
+			TimeoutMS:    2000,
+			ExtraHeaders: map[string]string{"X-Region": "eu", "X-Trace-ID": "t-1"},
+		},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("ProxyQuery failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotRegion != "eu" {
+		t.Fatalf("expected X-Region to be overridden by target header, got %s", gotRegion)
+	}
+	if gotTrace != "t-1" {
+		t.Fatalf("expected X-Trace-ID from target header, got %s", gotTrace)
+	}
+}
