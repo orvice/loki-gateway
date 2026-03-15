@@ -136,7 +136,6 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, w
 		return 0, err
 	}
 
-	timeout := time.Duration(target.TimeoutMS) * time.Millisecond
 	logger := bflog.FromContext(ctx).With(
 		"component", "forwarder.query",
 		"target", target.Name,
@@ -148,7 +147,7 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, w
 		"tenant", in.Header.Get("X-Scope-OrgID"),
 	)
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
