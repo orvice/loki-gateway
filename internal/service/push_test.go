@@ -1,6 +1,8 @@
 package service
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,8 +15,9 @@ import (
 )
 
 type pushCall struct {
-	target string
-	body   []byte
+	target  string
+	body    []byte
+	headers http.Header
 }
 
 type pushForwarderMock struct {
@@ -24,9 +27,9 @@ type pushForwarderMock struct {
 	ch    chan struct{}
 }
 
-func (m *pushForwarderMock) PostPush(_ context.Context, target config.LokiTarget, body []byte, _ http.Header) error {
+func (m *pushForwarderMock) PostPush(_ context.Context, target config.LokiTarget, body []byte, headers http.Header) error {
 	m.mu.Lock()
-	m.calls = append(m.calls, pushCall{target: target.Name, body: body})
+	m.calls = append(m.calls, pushCall{target: target.Name, body: body, headers: cloneHeaders(headers)})
 	m.mu.Unlock()
 	if m.ch != nil {
 		m.ch <- struct{}{}
@@ -134,6 +137,46 @@ func TestPushInvalidPayloadFallbackDefaultMissing(t *testing.T) {
 	err := svc.HandlePush(context.Background(), []byte("not-json"), http.Header{})
 	if err == nil {
 		t.Fatalf("expected error when fallback default target is missing")
+	}
+}
+
+func TestPushGzipPayloadRoutesAndDropsEncodingHeader(t *testing.T) {
+	cfg := config.LokiConfig{
+		DefaultTarget: "loki-a",
+		Targets: []config.LokiTarget{
+			{Name: "loki-a", URL: "http://a", TimeoutMS: 1000},
+			{Name: "loki-b", URL: "http://b", TimeoutMS: 1000},
+		},
+		Rules: []config.RouteRule{{Name: "staging", Match: map[string]string{"env": "staging"}, Target: "loki-b"}},
+	}
+	mock := &pushForwarderMock{ch: make(chan struct{}, 1)}
+	svc := NewPushService(cfg, mock, nil)
+
+	raw := []byte(`{"streams":[{"stream":{"env":"staging"},"values":[["1","line1"]]}]}`)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("gzip write failed: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close failed: %v", err)
+	}
+
+	headers := http.Header{
+		"Content-Encoding": []string{"gzip"},
+		"Content-Type":     []string{"application/json"},
+	}
+	if err := svc.HandlePush(context.Background(), buf.Bytes(), headers); err != nil {
+		t.Fatalf("HandlePush returned error: %v", err)
+	}
+
+	waitCalls(t, mock.ch, 1)
+	calls := mock.snapshot()
+	if len(calls) != 1 || calls[0].target != "loki-b" {
+		t.Fatalf("expected routing to loki-b, got %+v", calls)
+	}
+	if calls[0].headers.Get("Content-Encoding") != "" {
+		t.Fatalf("expected Content-Encoding removed after decode")
 	}
 }
 

@@ -1,12 +1,16 @@
 package service
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/orvice/loki-gateway/internal/config"
@@ -40,8 +44,14 @@ func NewPushService(cfg config.LokiConfig, f forwarder.Client, logger *slog.Logg
 }
 
 func (s *PushService) HandlePush(ctx context.Context, body []byte, headers http.Header) error {
+	decodeBody, decoded, err := decodePushBodyForRouting(body, headers)
+	if err != nil {
+		s.logger.Error("decode push body failed, fallback to default target", "encoding", headers.Get("Content-Encoding"), "error", err)
+		return s.forwardRawToDefault(ctx, body, headers)
+	}
+
 	var req pushRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.Unmarshal(decodeBody, &req); err != nil {
 		s.logger.Error("decode push payload failed, fallback to default target", "error", err)
 		return s.forwardRawToDefault(ctx, body, headers)
 	}
@@ -61,6 +71,13 @@ func (s *PushService) HandlePush(ctx context.Context, body []byte, headers http.
 		}
 	}
 
+	forwardHeaders := headers
+	if decoded {
+		forwardHeaders = cloneHeaders(headers)
+		forwardHeaders.Del("Content-Encoding")
+		forwardHeaders.Del("Content-Length")
+	}
+
 	bg := context.WithoutCancel(ctx)
 	for targetName, streams := range buckets {
 		target, ok := s.cfg.TargetByName(targetName)
@@ -75,7 +92,7 @@ func (s *PushService) HandlePush(ctx context.Context, body []byte, headers http.
 			continue
 		}
 
-		go s.forwardPush(bg, target, payload, headers)
+		go s.forwardPush(bg, target, payload, forwardHeaders)
 	}
 
 	return nil
@@ -109,4 +126,35 @@ func reasonFromError(err error) string {
 		return ""
 	}
 	return fmt.Sprintf("%T", err)
+}
+
+func decodePushBodyForRouting(body []byte, headers http.Header) ([]byte, bool, error) {
+	encoding := strings.ToLower(strings.TrimSpace(headers.Get("Content-Encoding")))
+	switch encoding {
+	case "", "identity":
+		return body, false, nil
+	case "gzip":
+		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, true, err
+		}
+		defer r.Close()
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, true, err
+		}
+		return decoded, true, nil
+	default:
+		return nil, true, fmt.Errorf("unsupported content encoding: %s", encoding)
+	}
+}
+
+func cloneHeaders(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	for k, vv := range src {
+		copied := make([]string, len(vv))
+		copy(copied, vv)
+		dst[k] = copied
+	}
+	return dst
 }
