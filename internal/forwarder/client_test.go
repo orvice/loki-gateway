@@ -2,7 +2,6 @@ package forwarder
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,29 +10,6 @@ import (
 
 	"github.com/orvice/loki-gateway/internal/config"
 )
-
-type contextBoundBody struct {
-	ctx context.Context
-}
-
-func (b *contextBoundBody) Read(_ []byte) (int, error) {
-	if err := b.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return 0, io.EOF
-}
-
-func (b *contextBoundBody) Close() error { return nil }
-
-type contextAwareRoundTripper struct{}
-
-func (contextAwareRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       &contextBoundBody{ctx: req.Context()},
-		Header:     make(http.Header),
-	}, nil
-}
 
 func TestPostPushForwardsBodyAndHeader(t *testing.T) {
 	var gotBody []byte
@@ -93,12 +69,15 @@ func TestProxyQueryForwardsQueryAndHeader(t *testing.T) {
 	client := NewHTTPClient()
 	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
 	req.Header.Set("X-Scope-OrgID", "tenant-x")
+	w := httptest.NewRecorder()
 
-	resp, err := client.ProxyQuery(context.Background(), config.LokiTarget{Name: "a", URL: ts.URL, TimeoutMS: 2000}, req)
+	status, err := client.ProxyQuery(context.Background(), config.LokiTarget{Name: "a", URL: ts.URL, TimeoutMS: 2000}, w, req)
 	if err != nil {
 		t.Fatalf("ProxyQuery failed: %v", err)
 	}
-	defer resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", status)
+	}
 
 	if gotPath != "/loki/api/v1/query" {
 		t.Fatalf("unexpected path: %s", gotPath)
@@ -108,6 +87,12 @@ func TestProxyQueryForwardsQueryAndHeader(t *testing.T) {
 	}
 	if gotScope != "tenant-x" {
 		t.Fatalf("unexpected scope: %s", gotScope)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected response code: %d", w.Code)
+	}
+	if w.Body.String() != `{"status":"success"}` {
+		t.Fatalf("unexpected response body: %s", w.Body.String())
 	}
 }
 
@@ -157,8 +142,9 @@ func TestProxyQueryUsesTargetBasicAuth(t *testing.T) {
 	client := NewHTTPClient()
 	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
 	req.Header.Set("Authorization", "Bearer token")
+	w := httptest.NewRecorder()
 
-	resp, err := client.ProxyQuery(
+	status, err := client.ProxyQuery(
 		context.Background(),
 		config.LokiTarget{
 			Name:      "a",
@@ -166,12 +152,15 @@ func TestProxyQueryUsesTargetBasicAuth(t *testing.T) {
 			TimeoutMS: 2000,
 			BasicAuth: config.BasicAuth{Username: "bob", Password: "pwd"},
 		},
+		w,
 		req,
 	)
 	if err != nil {
 		t.Fatalf("ProxyQuery failed: %v", err)
 	}
-	defer resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", status)
+	}
 
 	reqExpected := httptest.NewRequest(http.MethodGet, "/", nil)
 	reqExpected.SetBasicAuth("bob", "pwd")
@@ -225,8 +214,9 @@ func TestProxyQueryUsesTargetExtraHeadersWithOverride(t *testing.T) {
 	client := NewHTTPClient()
 	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
 	req.Header.Set("X-Region", "us")
+	w := httptest.NewRecorder()
 
-	resp, err := client.ProxyQuery(
+	status, err := client.ProxyQuery(
 		context.Background(),
 		config.LokiTarget{
 			Name:         "a",
@@ -234,12 +224,15 @@ func TestProxyQueryUsesTargetExtraHeadersWithOverride(t *testing.T) {
 			TimeoutMS:    2000,
 			ExtraHeaders: map[string]string{"X-Region": "eu", "X-Trace-ID": "t-1"},
 		},
+		w,
 		req,
 	)
 	if err != nil {
 		t.Fatalf("ProxyQuery failed: %v", err)
 	}
-	defer resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", status)
+	}
 
 	if gotRegion != "eu" {
 		t.Fatalf("expected X-Region to be overridden by target header, got %s", gotRegion)
@@ -249,24 +242,31 @@ func TestProxyQueryUsesTargetExtraHeadersWithOverride(t *testing.T) {
 	}
 }
 
-func TestProxyQueryDoesNotCancelBeforeCallerReadsBody(t *testing.T) {
-	client := &HTTPClient{
-		client: &http.Client{Transport: contextAwareRoundTripper{}},
-	}
+func TestProxyQueryPreservesRepeatedQueryParams(t *testing.T) {
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
 
-	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=up", nil)
-	resp, err := client.ProxyQuery(
+	client := NewHTTPClient()
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query=up&query=down&start=1&end=2", nil)
+	w := httptest.NewRecorder()
+
+	status, err := client.ProxyQuery(
 		context.Background(),
-		config.LokiTarget{Name: "a", URL: "http://example.com", TimeoutMS: 2000},
+		config.LokiTarget{Name: "a", URL: ts.URL, TimeoutMS: 2000},
+		w,
 		req,
 	)
 	if err != nil {
 		t.Fatalf("ProxyQuery failed: %v", err)
 	}
-	defer resp.Body.Close()
-
-	_, readErr := io.ReadAll(resp.Body)
-	if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
-		t.Fatalf("expected response body to remain readable before caller closes it, got %v", readErr)
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", status)
+	}
+	if gotQuery != "query=up&query=down&start=1&end=2" {
+		t.Fatalf("unexpected query: %s", gotQuery)
 	}
 }

@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"net/http/httputil"
+	"net/url"
 	"time"
 
 	bflog "butterfly.orx.me/core/log"
@@ -15,22 +16,34 @@ import (
 
 type Client interface {
 	PostPush(ctx context.Context, target config.LokiTarget, body []byte, headers http.Header) error
-	ProxyQuery(ctx context.Context, target config.LokiTarget, in *http.Request) (*http.Response, error)
+	ProxyQuery(ctx context.Context, target config.LokiTarget, w http.ResponseWriter, in *http.Request) (int, error)
 }
 
 type HTTPClient struct {
 	client *http.Client
 }
 
-type cancelOnCloseReadCloser struct {
-	io.ReadCloser
-	cancel context.CancelFunc
+type discardResponseWriter struct {
+	header http.Header
+	status int
 }
 
-func (c *cancelOnCloseReadCloser) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
-	return err
+func (w *discardResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *discardResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return len(p), nil
+}
+
+func (w *discardResponseWriter) WriteHeader(statusCode int) {
+	w.status = statusCode
 }
 
 func NewHTTPClient() *HTTPClient {
@@ -38,7 +51,11 @@ func NewHTTPClient() *HTTPClient {
 }
 
 func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, body []byte, headers http.Header) error {
-	path := strings.TrimRight(target.URL, "/") + "/loki/api/v1/push"
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		return err
+	}
+	path := "/loki/api/v1/push"
 	timeout := time.Duration(target.TimeoutMS) * time.Millisecond
 	logger := bflog.FromContext(ctx).With(
 		"component", "forwarder.push",
@@ -68,30 +85,52 @@ func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, bod
 		req.Header.Set("X-Scope-OrgID", target.TenantID)
 	}
 
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Transport = c.client.Transport
+	statusCode := 0
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		statusCode = resp.StatusCode
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	var proxyErr error
+	proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) {
+		proxyErr = err
+	}
+
+	outReq := req.Clone(ctx)
+	outReq.RequestURI = ""
+	w := &discardResponseWriter{}
+
 	logger.Info("forward push request", "body_bytes", len(body))
 	start := time.Now()
-	resp, err := c.client.Do(req)
-	if err != nil {
-		logger.Error("forward push request failed", "error", err)
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	logger.Info("forward push response", "status", resp.StatusCode, "latency_ms", time.Since(start).Milliseconds())
+	proxy.ServeHTTP(w, outReq)
 
-	if resp.StatusCode >= http.StatusMultipleChoices {
-		logger.Warn("forward push downstream error status", "status", resp.StatusCode)
-		return fmt.Errorf("downstream push status: %d", resp.StatusCode)
+	if proxyErr != nil {
+		logger.Error("forward push request failed", "error", proxyErr)
+		return proxyErr
+	}
+
+	if statusCode == 0 {
+		statusCode = w.status
+	}
+	logger.Info("forward push response", "status", statusCode, "latency_ms", time.Since(start).Milliseconds())
+
+	if statusCode >= http.StatusMultipleChoices {
+		logger.Warn("forward push downstream error status", "status", statusCode)
+		return fmt.Errorf("downstream push status: %d", statusCode)
 	}
 
 	return nil
 }
 
-func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, in *http.Request) (*http.Response, error) {
-	path := strings.TrimRight(target.URL, "/") + in.URL.Path
-	if in.URL.RawQuery != "" {
-		path += "?" + in.URL.RawQuery
+func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, w http.ResponseWriter, in *http.Request) (int, error) {
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		return 0, err
 	}
+
 	timeout := time.Duration(target.TimeoutMS) * time.Millisecond
 	logger := bflog.FromContext(ctx).With(
 		"component", "forwarder.query",
@@ -105,37 +144,49 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, i
 	)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, in.Method, path, nil)
-	if err != nil {
-		cancel()
-		logger.Error("create downstream query request failed", "error", err)
-		return nil, err
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	baseDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		baseDirector(req)
+		applyTargetBasicAuth(req, target)
+		applyTargetExtraHeaders(req, target)
+		if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
+			req.Header.Set("X-Scope-OrgID", target.TenantID)
+		}
 	}
-	copyHeaders(in.Header, req.Header)
-	applyTargetBasicAuth(req, target)
-	applyTargetExtraHeaders(req, target)
-	if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
-		req.Header.Set("X-Scope-OrgID", target.TenantID)
+	proxy.Transport = c.client.Transport
+
+	statusCode := 0
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		statusCode = resp.StatusCode
+		return nil
 	}
+
+	var proxyErr error
+	proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) {
+		proxyErr = err
+	}
+
+	outReq := in.Clone(ctx)
+	outReq.RequestURI = ""
 
 	logger.Info("forward query request")
 	start := time.Now()
-	resp, err := c.client.Do(req)
-	if err != nil {
-		cancel()
-		logger.Error("forward query request failed", "error", err)
-		return nil, err
+	proxy.ServeHTTP(w, outReq)
+
+	if proxyErr != nil {
+		logger.Error("forward query request failed", "error", proxyErr)
+		return 0, proxyErr
 	}
-	resp.Body = &cancelOnCloseReadCloser{
-		ReadCloser: resp.Body,
-		cancel:     cancel,
+
+	logger.Info("forward query response", "status", statusCode, "latency_ms", time.Since(start).Milliseconds())
+	if statusCode >= http.StatusBadRequest {
+		logger.Warn("forward query downstream error status", "status", statusCode)
 	}
-	logger.Info("forward query response", "status", resp.StatusCode, "latency_ms", time.Since(start).Milliseconds())
-	if resp.StatusCode >= http.StatusBadRequest {
-		logger.Warn("forward query downstream error status", "status", resp.StatusCode)
-	}
-	return resp, nil
+
+	return statusCode, nil
 }
 
 func copyHeaders(src, dst http.Header) {

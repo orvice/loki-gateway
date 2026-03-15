@@ -11,7 +11,7 @@ import (
 )
 
 type QueryProcessor interface {
-	Proxy(ctx context.Context, in *http.Request) (status int, body []byte, err error)
+	Proxy(ctx context.Context, w http.ResponseWriter, in *http.Request) (status int, err error)
 }
 
 func RegisterQueryRoutes(r gin.IRoutes, query QueryProcessor) {
@@ -24,7 +24,7 @@ func RegisterQueryRoutes(r gin.IRoutes, query QueryProcessor) {
 			"tenant", c.Request.Header.Get("X-Scope-OrgID"),
 		)
 
-		status, body, err := query.Proxy(c.Request.Context(), c.Request)
+		status, err := query.Proxy(c.Request.Context(), c.Writer, c.Request)
 		if errors.Is(err, service.ErrQueryUnavailable) {
 			logger.Error("default loki unavailable", "error", err)
 			c.JSON(http.StatusBadGateway, gin.H{"error": "default loki unavailable"})
@@ -36,7 +36,6 @@ func RegisterQueryRoutes(r gin.IRoutes, query QueryProcessor) {
 			return
 		}
 		logger.Info("query proxy response", "status", status)
-		c.Data(status, "application/json", body)
 	}
 
 	r.GET("/loki/api/v1/query", h)

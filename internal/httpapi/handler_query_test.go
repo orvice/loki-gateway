@@ -13,12 +13,16 @@ import (
 
 type queryProcessorMock struct {
 	status int
-	body   []byte
 	err    error
 }
 
-func (m *queryProcessorMock) Proxy(context.Context, *http.Request) (int, []byte, error) {
-	return m.status, m.body, m.err
+func (m *queryProcessorMock) Proxy(_ context.Context, w http.ResponseWriter, _ *http.Request) (int, error) {
+	if m.err == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(m.status)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}
+	return m.status, m.err
 }
 
 func TestQueryHandlerAllSupportedEndpoints(t *testing.T) {
@@ -33,7 +37,7 @@ func TestQueryHandlerAllSupportedEndpoints(t *testing.T) {
 		t.Run(p, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			r := gin.New()
-			RegisterQueryRoutes(r, &queryProcessorMock{status: http.StatusOK, body: []byte(`{"status":"success"}`)})
+			RegisterQueryRoutes(r, &queryProcessorMock{status: http.StatusOK})
 
 			req := httptest.NewRequest(http.MethodGet, p, nil)
 			w := httptest.NewRecorder()
@@ -41,6 +45,9 @@ func TestQueryHandlerAllSupportedEndpoints(t *testing.T) {
 
 			if w.Code != http.StatusOK {
 				t.Fatalf("expected 200, got %d", w.Code)
+			}
+			if w.Body.String() != `{"status":"success"}` {
+				t.Fatalf("expected proxied body, got %s", w.Body.String())
 			}
 		})
 	}

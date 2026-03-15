@@ -34,8 +34,8 @@ func (m *pushForwarderMock) PostPush(_ context.Context, target config.LokiTarget
 	return m.err
 }
 
-func (m *pushForwarderMock) ProxyQuery(context.Context, config.LokiTarget, *http.Request) (*http.Response, error) {
-	return nil, errors.New("not used")
+func (m *pushForwarderMock) ProxyQuery(context.Context, config.LokiTarget, http.ResponseWriter, *http.Request) (int, error) {
+	return 0, errors.New("not used")
 }
 
 func (m *pushForwarderMock) snapshot() []pushCall {
