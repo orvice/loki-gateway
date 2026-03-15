@@ -86,6 +86,11 @@ func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, bod
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	baseDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		baseDirector(req)
+		req.Host = targetURL.Host
+	}
 	proxy.Transport = c.client.Transport
 	statusCode := 0
 	proxy.ModifyResponse = func(resp *http.Response) error {
@@ -150,6 +155,7 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, w
 	baseDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		baseDirector(req)
+		req.Host = targetURL.Host
 		applyTargetBasicAuth(req, target)
 		applyTargetExtraHeaders(req, target)
 		if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {

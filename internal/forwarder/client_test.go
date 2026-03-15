@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -15,10 +16,12 @@ func TestPostPushForwardsBodyAndHeader(t *testing.T) {
 	var gotBody []byte
 	var gotScope string
 	var gotPath string
+	var gotHost string
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotScope = r.Header.Get("X-Scope-OrgID")
+		gotHost = r.Host
 		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -39,6 +42,10 @@ func TestPostPushForwardsBodyAndHeader(t *testing.T) {
 	if string(gotBody) != `{"streams":[]}` {
 		t.Fatalf("unexpected body: %s", string(gotBody))
 	}
+	u, _ := url.Parse(ts.URL)
+	if gotHost != u.Host {
+		t.Fatalf("unexpected host: %s", gotHost)
+	}
 }
 
 func TestPostPushTimeout(t *testing.T) {
@@ -57,10 +64,12 @@ func TestPostPushTimeout(t *testing.T) {
 
 func TestProxyQueryForwardsQueryAndHeader(t *testing.T) {
 	var gotPath, gotQuery, gotScope string
+	var gotHost string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotQuery = r.URL.RawQuery
 		gotScope = r.Header.Get("X-Scope-OrgID")
+		gotHost = r.Host
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"success"}`))
 	}))
@@ -87,6 +96,10 @@ func TestProxyQueryForwardsQueryAndHeader(t *testing.T) {
 	}
 	if gotScope != "tenant-x" {
 		t.Fatalf("unexpected scope: %s", gotScope)
+	}
+	u, _ := url.Parse(ts.URL)
+	if gotHost != u.Host {
+		t.Fatalf("unexpected host: %s", gotHost)
 	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected response code: %d", w.Code)
