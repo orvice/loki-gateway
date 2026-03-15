@@ -42,10 +42,12 @@ func NewPushService(cfg config.LokiConfig, f forwarder.Client, logger *slog.Logg
 func (s *PushService) HandlePush(ctx context.Context, body []byte, headers http.Header) error {
 	var req pushRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		return ErrInvalidPushPayload
+		s.logger.Error("decode push payload failed, fallback to default target", "error", err)
+		return s.forwardRawToDefault(ctx, body, headers)
 	}
 	if req.Streams == nil {
-		return ErrInvalidPushPayload
+		s.logger.Error("push payload missing streams, fallback to default target")
+		return s.forwardRawToDefault(ctx, body, headers)
 	}
 
 	buckets := make(map[string][]pushStream)
@@ -76,6 +78,16 @@ func (s *PushService) HandlePush(ctx context.Context, body []byte, headers http.
 		go s.forwardPush(bg, target, payload, headers)
 	}
 
+	return nil
+}
+
+func (s *PushService) forwardRawToDefault(ctx context.Context, body []byte, headers http.Header) error {
+	target, ok := s.cfg.TargetByName(s.cfg.DefaultTarget)
+	if !ok {
+		return fmt.Errorf("default_target=%q not found for fallback", s.cfg.DefaultTarget)
+	}
+
+	go s.forwardPush(context.WithoutCancel(ctx), target, body, headers)
 	return nil
 }
 

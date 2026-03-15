@@ -110,10 +110,30 @@ func TestPushMulticastDedup(t *testing.T) {
 }
 
 func TestPushInvalidPayload(t *testing.T) {
-	svc := NewPushService(config.LokiConfig{}, &pushForwarderMock{}, nil)
+	cfg := config.LokiConfig{
+		DefaultTarget: "loki-a",
+		Targets:       []config.LokiTarget{{Name: "loki-a", URL: "http://a", TimeoutMS: 1000}},
+	}
+	mock := &pushForwarderMock{ch: make(chan struct{}, 1)}
+	svc := NewPushService(cfg, mock, nil)
+
 	err := svc.HandlePush(context.Background(), []byte("not-json"), http.Header{})
-	if !errors.Is(err, ErrInvalidPushPayload) {
-		t.Fatalf("expected ErrInvalidPushPayload, got %v", err)
+	if err != nil {
+		t.Fatalf("expected nil error on invalid payload fallback, got %v", err)
+	}
+
+	waitCalls(t, mock.ch, 1)
+	calls := mock.snapshot()
+	if len(calls) != 1 || calls[0].target != "loki-a" {
+		t.Fatalf("expected fallback to default target loki-a, got %+v", calls)
+	}
+}
+
+func TestPushInvalidPayloadFallbackDefaultMissing(t *testing.T) {
+	svc := NewPushService(config.LokiConfig{DefaultTarget: "missing"}, &pushForwarderMock{}, nil)
+	err := svc.HandlePush(context.Background(), []byte("not-json"), http.Header{})
+	if err == nil {
+		t.Fatalf("expected error when fallback default target is missing")
 	}
 }
 
