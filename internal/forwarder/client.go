@@ -79,17 +79,17 @@ func (c *HTTPClient) PostPush(ctx context.Context, target config.LokiTarget, bod
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	applyTargetBasicAuth(req, target)
-	applyTargetExtraHeaders(req, target)
-	if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
-		req.Header.Set("X-Scope-OrgID", target.TenantID)
-	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	baseDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		baseDirector(req)
-		req.Host = targetURL.Host
+	proxy.Director = nil
+	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
+		pr.SetURL(targetURL)
+		pr.Out.Host = targetURL.Host
+		applyTargetBasicAuth(pr.Out, target)
+		applyTargetExtraHeaders(pr.Out, target)
+		if pr.Out.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
+			pr.Out.Header.Set("X-Scope-OrgID", target.TenantID)
+		}
 	}
 	proxy.Transport = c.client.Transport
 	statusCode := 0
@@ -152,14 +152,14 @@ func (c *HTTPClient) ProxyQuery(ctx context.Context, target config.LokiTarget, w
 	defer cancel()
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	baseDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		baseDirector(req)
-		req.Host = targetURL.Host
-		applyTargetBasicAuth(req, target)
-		applyTargetExtraHeaders(req, target)
-		if req.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
-			req.Header.Set("X-Scope-OrgID", target.TenantID)
+	proxy.Director = nil
+	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
+		pr.SetURL(targetURL)
+		pr.Out.Host = targetURL.Host
+		applyTargetBasicAuth(pr.Out, target)
+		applyTargetExtraHeaders(pr.Out, target)
+		if pr.Out.Header.Get("X-Scope-OrgID") == "" && target.TenantID != "" {
+			pr.Out.Header.Set("X-Scope-OrgID", target.TenantID)
 		}
 	}
 	proxy.Transport = c.client.Transport
